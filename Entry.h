@@ -34,6 +34,10 @@ typedef GPPC::xyLoc xyLoc;
 void PreprocessMap(const std::vector<bool> &bits, int width, int height, const std::string &filename);
 void *PrepareForSearch(const std::vector<bool> &bits, int width, int height, const std::string &filename);
 
+void summarize_expansions();
+extern std::vector<int> expansion_log;
+extern long long heuristic_micro_time_global;
+
 
 /*
 return true if the pathfinding is completed (even if not path exist), 
