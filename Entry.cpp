@@ -199,7 +199,6 @@ std::tuple<int, int, vector<double>, vector<double>> getFarthestPairAndDistances
 
 
 // FastMap algorithm: returns an embedding (a vector of coordinate vectors for each node).
-// This version uses the paper's indexing: Start with K = 1 and decrement the available budget (Kmax) each iteration.
 vector<vector<double>> fastMap(vector<Edge> edges, int n, int Kmax, double epsilon) {
     // Initialize: we work on a copy of the edges; w0 represents the current (residual) edge weights.
     vector<Edge> w0 = edges;
@@ -265,80 +264,50 @@ vector<vector<double>> fastMap(vector<Edge> edges, int n, int Kmax, double epsil
 }
 
 
+vector<vector<double>> fastMap_DHHYBRID(vector<Edge> edges, int n, int Kmax, double epsilon) {
+    vector<Edge> w0 = edges;
+    AdjList workAdj = buildAdjList(w0, n);
+    vector<vector<double>> embedding(n);
 
+    // --- Step 1: FastMap for first (Kmax - 1) dimensions ---
+    for (int dim = 0; dim < Kmax - 1; ++dim) {
+        workAdj = buildAdjList(w0, n);
 
-enum class FastMapNorm { L1, L2 };
-
-
-// Enhanced FastMap
-// - edges:      original graph edges
-// - n:          number of nodes
-// - Kmax:       number of dimensions to build
-// - epsilon:    stop when pivot‐pair distance < epsilon
-// - normMode:   use L1 or L2 for both heuristic and residual update
-// - pivotsOut:  if non‐null, filled with the chosen pivot pairs (na, nb)
-vector<vector<double>> fastMapEnhanced(
-    const vector<Edge>& edges,
-    int n,
-    int Kmax,
-    double epsilon,
-    FastMapNorm normMode = FastMapNorm::L1,
-    vector<pair<int,int>>* pivotsOut = nullptr
-) {
-    // 1) Guards
-    if (n <= 0) return {};         // no nodes
-    if (Kmax <= 0) return vector<vector<double>>(n);
-    const double INF = numeric_limits<double>::max();
-
-    // 2) Prepare
-    vector<Edge> w0 = edges;             // residual weights
-    vector<vector<double>> embedding(n);  // embedding[v][dim]
-    vector<pair<int,int>> pivots;         // record (na,nb)
-
-    // 3) Main loop
-    while (Kmax-- > 0) {
-        // Build residual graph
-        AdjList adj = buildAdjList(w0, n);
-
-        // Select pivot pair
-        auto [na, nb] = getFarthestPair(adj, n);
-        pivots.emplace_back(na, nb);
-
-        // Compute distances in residual graph
-        vector<double> distA = dijkstra(adj, na, n);
-        vector<double> distB = dijkstra(adj, nb, n);
+        auto [na, nb] = getFarthestPair(workAdj, n);
+        vector<double> distA = dijkstra(workAdj, na, n);
+        vector<double> distB = dijkstra(workAdj, nb, n);
 
         double dab = distA[nb];
-        if (dab == INF || dab < epsilon) break;
+        if (dab < epsilon) break;
 
-        // 4) Embed each node
-        for (int v = 0; v < n; v++) {
-            double coord;
-            if (distA[v] == INF || distB[v] == INF) {
-                coord = 0.0;  // fallback if unreachable
-            } else {
-                coord = (distA[v] + dab - distB[v]) / 2.0;
-            }
+        for (int v = 0; v < n; ++v) {
+            const double INF = std::numeric_limits<double>::max();
+            double coord = (distA[v] == INF || distB[v] == INF || dab == INF)
+                ? 0.0 : (distA[v] + dab - distB[v]) / 2.0;
             embedding[v].push_back(coord);
         }
 
-        // 5) Residual normalization: subtract the SAME norm from each edge
-        for (auto &e : w0) {
-            double x_u = embedding[e.u].back();
-            double x_v = embedding[e.v].back();
-            double diff = (normMode == FastMapNorm::L2)
-                          ? sqrt((x_u - x_v)*(x_u - x_v))
-                          : fabs(x_u - x_v);
-            e.w = max(0.0, e.w - diff);
+        for (auto &edge : w0) {
+            double diff = fabs(embedding[edge.u].back() - embedding[edge.v].back());
+            edge.w = max(0.0, edge.w - diff);
         }
     }
 
-    // 6) Output pivot pairs if requested
-    if (pivotsOut) *pivotsOut = pivots;
+    // --- Step 2: Add DH as final dimension ---
+    // Use a random pivot
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int> dist(0, n - 1);
+    int pivot = dist(rng);
+
+    // Run DH from pivot in index space
+    vector<double> dh = dijkstra(workAdj, pivot, n);  // Note: uses residual graph
+
+    for (int v = 0; v < n; ++v) {
+        embedding[v].push_back(dh[v]);
+    }
 
     return embedding;
 }
-
 
 // FM-based heuristic function: returns L1 distance between two embedding vectors.
 float fm_heuristic(const vector<double>& embA, const vector<double>& embB) {
@@ -348,7 +317,6 @@ float fm_heuristic(const vector<double>& embA, const vector<double>& embB) {
     }
     return distance;
 }
-
 
 
 unordered_map<pii, vector<double>, pair_hash> fmEmbedding_HE;
@@ -383,7 +351,7 @@ AdjList buildAdjList_E(const vector<Edge_E>& edges, int n) {
 }
 //------------------------------------------------------------
 // HE Pivot Selection Routine
-pair<int,int> getFarthestPair_HE(const AdjList &workAdj, int n) {
+pair<int,int> getFarthestPair_HE_1(const AdjList &workAdj, int n) {
     if (n == 0) {
         std::cerr << "[ERROR] getFarthestPair_HE called with n = 0." << std::endl;
         exit(1);
@@ -444,6 +412,56 @@ pair<int,int> getFarthestPair_HE(const AdjList &workAdj, int n) {
     return {p1, p2};
 }
 
+pair<int,int> getFarthestPair_HE(const AdjList& workAdj, int n,
+    const function<double(const pii&, const pii&)>& heuristic
+) {
+    if (n == 0) {
+        std::cerr << "[ERROR] getFarthestPair_HE called with n = 0." << std::endl;
+        exit(1);
+    }
+
+    int t = rand() % n;
+    vector<double> distT = dijkstra(workAdj, t, n);
+
+    double maxVal = -numeric_limits<double>::infinity();
+    int p1 = t;
+
+    for (int v = 0; v < n; v++) {
+        double d_val = distT[v];
+        if (d_val == numeric_limits<double>::max()) continue;
+
+        pii cell_t = indexToCell_E[t];
+        pii cell_v = indexToCell_E[v];
+        double h_val = heuristic(cell_t, cell_v);
+
+        double value = 3.0 * d_val - 2.0 * h_val;
+        if (value > maxVal) {
+            maxVal = value;
+            p1 = v;
+        }
+    }
+
+    vector<double> distP1 = dijkstra(workAdj, p1, n);
+    maxVal = -numeric_limits<double>::infinity();
+    int p2 = p1;
+
+    for (int v = 0; v < n; v++) {
+        double d_val = distP1[v];
+        if (d_val == numeric_limits<double>::max()) continue;
+
+        pii cell_p1 = indexToCell_E[p1];
+        pii cell_v = indexToCell_E[v];
+        double h_val = heuristic(cell_p1, cell_v);
+
+        double value = 3.0 * d_val - 2.0 * h_val;
+        if (value > maxVal) {
+            maxVal = value;
+            p2 = v;
+        }
+    }
+
+    return {p1, p2};
+}
 
 //------------------------------------------------------------
 // FastMap_HE: FastMap embedding with HE pivot selection.
@@ -462,7 +480,7 @@ vector<vector<double>> fastMap_HE(vector<Edge_E> edges, int n, int Kmax, double 
         workAdj = buildAdjList_E(w0, n);
         
         // Use HE pivot selection to get the farthest pair.
-        pair<int,int> farPair = getFarthestPair_HE(workAdj, n);
+        pair<int,int> farPair = getFarthestPair_HE_1(workAdj, n);
         int na = farPair.first, nb = farPair.second;
         
         // Compute shortest path distances from the pivots.
@@ -501,16 +519,109 @@ vector<vector<double>> fastMap_HE(vector<Edge_E> edges, int n, int Kmax, double 
     return embedding;
 }
 
+vector<vector<double>> fastMap_HEHybrid_1(vector<Edge_E> edges, int n, int Kmax, double epsilon) {
+    vector<Edge_E> w0 = edges;
+    AdjList workAdj = buildAdjList_E(w0, n);
+    vector<vector<double>> embedding(n);
+
+    // --- Step 1: FM (HE pivots) for first Kmax-1 dims ---
+    for (int dim = 0; dim < Kmax - 1; ++dim) {
+        workAdj = buildAdjList_E(w0, n);
+
+        pair<int, int> farPair = getFarthestPair_HE_1(workAdj, n);
+        int na = farPair.first, nb = farPair.second;
+
+        vector<double> distA = dijkstra(workAdj, na, n);
+        vector<double> distB = dijkstra(workAdj, nb, n);
+        double dab = distA[nb];
+        if (dab < epsilon) break;
+
+        for (int v = 0; v < n; ++v) {
+            const double INF = std::numeric_limits<double>::max();
+            double coord = (distA[v] == INF || distB[v] == INF || dab == INF)
+                ? 0.0 : (distA[v] + dab - distB[v]) / 2.0;
+            embedding[v].push_back(coord);
+        }
+
+        for (auto& edge : w0) {
+            double diff = fabs(embedding[edge.u].back() - embedding[edge.v].back());
+            edge.w = max(0.0, edge.w - diff);
+        }
+    }
+
+    // --- Step 2: Add DH[0] as last dimension ---
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int> dist(0, n - 1);
+    int pivot = dist(rng);
+
+    vector<double> dh = dijkstra(workAdj, pivot, n);  // residual graph
+
+    for (int v = 0; v < n; ++v) {
+        embedding[v].push_back(dh[v]);
+    }
+
+    return embedding;
+}
+
+vector<vector<double>> fastMap_HEHybrid(vector<Edge_E> edges, int n, int Kmax, double epsilon) {
+    vector<Edge_E> w0 = edges;
+    AdjList workAdj = buildAdjList_E(w0, n);
+    vector<vector<double>> embedding(n);
+
+    // Default heuristic: octile distance
+    auto heuristic_fn = [](const pii& a, const pii& b) {
+        int dr = abs(a.first - b.first);
+        int dc = abs(a.second - b.second);
+        return max(dr, dc) + (sqrt(2.0f) - 1.0f) * min(dr, dc);
+    };
+
+    // --- Step 1: FM (HE pivots) for first Kmax-1 dims ---
+    for (int dim = 0; dim < Kmax - 1; ++dim) {
+        workAdj = buildAdjList_E(w0, n);
+
+        pair<int, int> farPair = getFarthestPair_HE(workAdj, n, heuristic_fn);
+        int na = farPair.first, nb = farPair.second;
+
+        vector<double> distA = dijkstra(workAdj, na, n);
+        vector<double> distB = dijkstra(workAdj, nb, n);
+        double dab = distA[nb];
+        if (dab < epsilon) break;
+
+        for (int v = 0; v < n; ++v) {
+            const double INF = std::numeric_limits<double>::max();
+            double coord = (distA[v] == INF || distB[v] == INF || dab == INF)
+                ? 0.0 : (distA[v] + dab - distB[v]) / 2.0;
+            embedding[v].push_back(coord);
+        }
+
+        // update heuristic_fn to use current FM embedding as heuristic if you wish
+        // this keeps using octile unless you switch (optionally)
+        for (auto& edge : w0) {
+            double diff = fabs(embedding[edge.u].back() - embedding[edge.v].back());
+            edge.w = max(0.0, edge.w - diff);
+        }
+    }
+
+    // --- Step 2: Add DH[0] as last dimension ---
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int> dist(0, n - 1);
+    int pivot = dist(rng);
+    vector<double> dh = dijkstra(workAdj, pivot, n);  // residual graph
+
+    for (int v = 0; v < n; ++v) {
+        embedding[v].push_back(dh[v]);
+    }
+
+    return embedding;
+}
 
 // ---------------- Global Storage ----------------
 unordered_set<pii, pair_hash> global_obstacles;
 int global_width = 0, global_height = 0;
 
 
-
 // Build a graph from the grid: free (non-obstacle) cells become nodes; edges connect 8-connected free cells.
-void buildGraphFromGrid_E(const pair<int, int>& grid_size, const unordered_set<pii, pair_hash>& obstacles,
-                        vector<Edge_E>& edges) {
+void buildGraphFromGrid_E(const pair<int, int>& grid_size, const unordered_set<pii, pair_hash>& obstacles, vector<Edge_E>& edges) {
     cellToIndex_E.clear();
     indexToCell_E.clear();
     int n = 0;
@@ -540,8 +651,6 @@ void buildGraphFromGrid_E(const pair<int, int>& grid_size, const unordered_set<p
         }
     }
 }
-
-
 
 void build_fmEmbedding_HE(int width, int height, int Kmax_HE, double epsilon) {
     // int Kmax_HE = 9;           // Number of FM dimensions
@@ -576,7 +685,10 @@ void build_fmEmbedding_HE(int width, int height, int Kmax_HE, double epsilon) {
     }
 
     // Run FastMap with HE pivot selection
-    vector<vector<double>> embedding_HE = fastMap_HE(edges, numFreeCells, Kmax_HE, epsilon);
+    // vector<vector<double>> embedding_HE = fastMap_HE(edges, numFreeCells, Kmax_HE, epsilon);
+    vector<vector<double>> embedding_HE = fastMap_HEHybrid(edges, numFreeCells, Kmax_HE, epsilon);
+
+    
 
     if (embedding_HE.size() != numFreeCells) {
         std::cerr << "[FATAL] FastMap embedding size mismatch." << std::endl;
@@ -601,6 +713,7 @@ void build_fmEmbedding_HE(int width, int height, int Kmax_HE, double epsilon) {
 
 // Global variables for FM.
 unordered_map<pii, vector<double>, pair_hash> fmEmbedding;
+unordered_map<pii, vector<double>, pair_hash> fmEmbedding_DH;
 unordered_map<pii, int, pair_hash> cellToIndex;
 vector<pii> indexToCell;
 vector<double> dhVector;  // or vector<float> dhVector;
@@ -608,7 +721,6 @@ vector<vector<double>> dhVectors;  // Each inner vector is one landmark's Dijkst
 
 struct FMContext {
     long long heuristic_micro_time;  // or double heuristic_seconds;
-    // You can add more things here later (e.g., Kmax, embedding stats, etc.)
 };
 
 
@@ -617,8 +729,7 @@ vector<int> expansion_log;
 
 
 // Build a graph from the grid: free (non-obstacle) cells become nodes; edges connect 8-connected free cells.
-void buildGraphFromGrid(const pair<int, int>& grid_size, const unordered_set<pii, pair_hash>& obstacles,
-                        vector<Edge>& edges) {
+void buildGraphFromGrid(const pair<int, int>& grid_size, const unordered_set<pii, pair_hash>& obstacles, vector<Edge>& edges) {
     cellToIndex.clear();
     indexToCell.clear();
     int n = 0;
@@ -656,10 +767,9 @@ enum HeuristicMode {
     DH,
     FM,
     FM_DH_ED,
+    FM_DH_HE,
     MAX_DH_FM_ED,
     MAX_DH_FMDH_ED,
-    FM_DH_HE,
-    MAX_DH_FM_HE,
     MAX_DH_FMDH_HE
 };
 
@@ -678,7 +788,7 @@ vector<pii> a_star(const pii& start, const pii& goal, const pair<int, int>& grid
     unordered_map<pii, float, pair_hash> f;
     unordered_map<pii, pii, pair_hash> came_from;
     
-    HeuristicMode selected_mode = MAX_DH_FM_ED;  // change this to try different options
+    HeuristicMode selected_mode = MAX_DH_FMDH_HE;  // change this to try different options
     std::function<float(const pii&, const pii&)> get_h;
     switch (selected_mode) {
 
@@ -734,37 +844,65 @@ vector<pii> a_star(const pii& start, const pii& goal, const pair<int, int>& grid
             };
             break;
         }
-    
-        case FM_DH_ED:{
-            // FM + DH with ED
+
+        case FM_DH_HE: {
+            // FM[k−1] + DH[0] using HE-based hybrid embedding
             get_h = [&](const pii &a, const pii &b) -> float {
-                float fm_val = 0.0f;
-                if (fmEmbedding.count(a) && fmEmbedding.count(b) &&
-                    !fmEmbedding[a].empty() && !fmEmbedding[b].empty()) {
-                    fm_val = fm_heuristic(fmEmbedding[a], fmEmbedding[b]);
+                if (fmEmbedding_HE.count(a) && fmEmbedding_HE.count(b) &&
+                    !fmEmbedding_HE[a].empty() && !fmEmbedding_HE[b].empty()) {
+                    
+                    const auto& emb_a = fmEmbedding_HE[a];
+                    const auto& emb_b = fmEmbedding_HE[b];
+                    int dim_count = emb_a.size();
+                    if (dim_count < 1) return 0.0f;
+        
+                    float fmdh_val = 0.0f;
+        
+                    // Sum first k FM dimensions
+                    for (int i = 0; i < dim_count ; ++i) {
+                        fmdh_val += fabs(emb_a[i] - emb_b[i]);
+                    }
+        
+                    // // last DH dimension already in FM embedding
+                    return fmdh_val;
+
                 } else {
-                    // Fallback: use octile distance if the FM embedding is missing.
+                    // Fallback to octile
                     int dr = abs(a.first - b.first);
                     int dc = abs(a.second - b.second);
-                    fm_val = max(dr, dc) + (sqrt(2.0) - 1) * min(dr, dc);
+                    return max(dr, dc) + (sqrt(2.0f) - 1.0f) * min(dr, dc);
                 }
-
-                int idx_a = a.first * global_width + a.second;
-                int idx_b = b.first * global_width + b.second;
+            };
+            break;
+        }
+        
+        case FM_DH_ED:{
+            get_h = [&](const pii& a, const pii& b) -> float {
+                if (fmEmbedding.count(a) && fmEmbedding.count(b) &&
+                    !fmEmbedding[a].empty() && !fmEmbedding[b].empty()) {
+                    
+                    const auto& emb_a = fmEmbedding[a];
+                    const auto& emb_b = fmEmbedding[b];
+                    float fmdh_val = 0.0f;
             
-                float max_h = 0.0f;
-                for (const auto& dh : dhVectors) {
-                    double dist_a = dh[idx_a];
-                    double dist_b = dh[idx_b];
-                    // Check for unreachable cells; if either is unreachable, skip this pivot.
-                    if(dist_a == numeric_limits<double>::max() || dist_b == numeric_limits<double>::max())
-                        continue;
-                    float h = fabs(dist_a - dist_b);
-                    if (h > max_h)
-                        max_h = h;
+                    int dim_count = emb_a.size();
+                    if (dim_count < 1) return 0.0f;  // safeguard
+            
+                    // --- FM[k] ---
+                    for (int i = 0; i < dim_count; ++i) {
+                        fmdh_val += fabs(emb_a[i] - emb_b[i]);  // L1 distance
+                    }
+            
+                    // --- DH[0] is already in FM embedding ---
+
+                    return fmdh_val;
+            
+                } else {
+                    std::cerr << "[FM+DH] Embedding not available, using Octile.\n";
+                    int dr = abs(a.first - b.first);
+                    int dc = abs(a.second - b.second);
+                    return max(dr, dc) + (sqrt(2.0f) - 1.0f) * min(dr, dc);
                 }
-                float dh_val = max_h;
-                return fm_val + dh_val;
             };
             break;
         }
@@ -804,28 +942,32 @@ vector<pii> a_star(const pii& start, const pii& goal, const pair<int, int>& grid
         
         case MAX_DH_FMDH_ED: {
             get_h = [&](const pii &a, const pii &b) -> float {
-                // --- FM4 ---
-                float fm_val = 0.0f;
+                float fm_dh_val = 0.0f;
                 if (fmEmbedding.count(a) && fmEmbedding.count(b) &&
                     !fmEmbedding[a].empty() && !fmEmbedding[b].empty()) {
-                    fm_val = fm_heuristic(fmEmbedding[a], fmEmbedding[b]);
+                    
+                    const auto& emb_a = fmEmbedding[a];
+                    const auto& emb_b = fmEmbedding[b];
+                    int dim_count = emb_a.size();
+                    if (dim_count < 1) return 0.0f;
+        
+                    // FM[k]: sum of first (k) coordinates
+                    for (int i = 0; i < dim_count; ++i) {
+                        fm_dh_val += fabs(emb_a[i] - emb_b[i]);
+                    }
+        
+                    // DH[0] is already in FM embedding
                 } else {
-                    // Fallback to octile distance
+                    // Fallback: octile
                     int dr = abs(a.first - b.first);
                     int dc = abs(a.second - b.second);
-                    fm_val = max(dr, dc) + (sqrt(2.0f) - 1.0f) * min(dr, dc);
+                    fm_dh_val = max(dr, dc) + (sqrt(2.0f) - 1.0f) * min(dr, dc);
                 }
         
-                // --- DH[0] (first vector) ---
+                // DH5: max over all dhVectors
                 int idx_a = a.first * global_width + a.second;
                 int idx_b = b.first * global_width + b.second;
         
-                const auto& dhEmbedding0 = dhVectors[0];
-                float dh1_val = fabs(dhEmbedding0[idx_a] - dhEmbedding0[idx_b]);
-        
-                float hybrid_val = fm_val + dh1_val;
-        
-                // --- DH5 (max over all landmarks) ---
                 float dh5_val = 0.0f;
                 for (const auto& dh : dhVectors) {
                     double dist_a = dh[idx_a];
@@ -837,82 +979,40 @@ vector<pii> a_star(const pii& start, const pii& goal, const pair<int, int>& grid
                         dh5_val = h;
                 }
         
-                // Return max[FM4 + DH1, DH5]
-                return std::max(hybrid_val, dh5_val);
+                return std::max(fm_dh_val, dh5_val);  // max[FM[k−1] + DH[0], DH5]
             };
             break;
         }
         
-        case FM_DH_HE:{
-            // FM + DH with HE
+        case MAX_DH_FMDH_HE: {
+            // max[FM[k−1] + DH[0], DH5] using HE-based FM embedding
             get_h = [&](const pii &a, const pii &b) -> float {
-                // Hybrid: FMk+DH computed using HE-based FM.
-                // FM
-                float fm4_val = 0.0f;
-                // Octile distance
-                float octile = 0.0f;
-                int dr = abs(a.first - b.first);
-                int dc = abs(a.second - b.second);
-                octile = max(dr, dc) + (sqrt(2.0f) - 1) * min(dr, dc);
-
+                float hybrid_val = 0.0f;
+        
                 if (fmEmbedding_HE.count(a) && fmEmbedding_HE.count(b) &&
                     !fmEmbedding_HE[a].empty() && !fmEmbedding_HE[b].empty()) {
-                    fm4_val = fm_heuristic(fmEmbedding_HE[a], fmEmbedding_HE[b]);
+                    
+                    const auto& emb_a = fmEmbedding_HE[a];
+                    const auto& emb_b = fmEmbedding_HE[b];
+                    int dim_count = emb_a.size();
+        
+                    // FM[k]
+                    for (int i = 0; i < dim_count; ++i) {
+                        hybrid_val += fabs(emb_a[i] - emb_b[i]);
+                    }
+        
+                    // + DH[0] is already in FM embedding
                 } else {
-                    fm4_val = octile;
+                    // fallback: use octile
+                    int dr = abs(a.first - b.first);
+                    int dc = abs(a.second - b.second);
+                    hybrid_val = max(dr, dc) + (sqrt(2.0f) - 1.0f) * min(dr, dc);
                 }
-                
+        
+                // --- DH5: max over k DH vectors ---
                 int idx_a = a.first * global_width + a.second;
                 int idx_b = b.first * global_width + b.second;
-
-                // // DH1
-                // const auto& dhEmbedding_HE = dhVectors[0];  // Assuming you used computeDHVectors(1)
-                // float dh1_val = fabs(dhEmbedding_HE[idx_a] - dhEmbedding_HE[idx_b]);  // DH for hybrid computed with HE-based FM.
-
-                float max_h = 0.0f;
-                for (const auto& dh_E : dhVectors_E) {
-                    double dist_a = dh_E[idx_a];
-                    double dist_b = dh_E[idx_b];
-                    // Check for unreachable cells; if either is unreachable, skip this pivot.
-                    if(dist_a == numeric_limits<double>::max() || dist_b == numeric_limits<double>::max())
-                        continue;
-                    float h = fabs(dist_a - dist_b);
-                    if (h > max_h)
-                        max_h = h;
-                }
-                float dh__E_val = max_h;
-
-                return fm4_val + dh__E_val;
-            };
-            break;
-        }
-            
-        case MAX_DH_FMDH_HE:{
-            get_h = [&](const pii &a, const pii &b) -> float {
-                // Hybrid: FM4+DH computed using HE-based FM.
-                float fm4_val = 0.0f;
-                float octile = 0.0f;
-                int dr = abs(a.first - b.first);
-                int dc = abs(a.second - b.second);
-                octile = max(dr, dc) + (sqrt(2.0f) - 1) * min(dr, dc);
-
-                if (fmEmbedding_HE.count(a) && fmEmbedding_HE.count(b) &&
-                    !fmEmbedding_HE[a].empty() && !fmEmbedding_HE[b].empty()) {
-                    fm4_val = fm_heuristic(fmEmbedding_HE[a], fmEmbedding_HE[b]);
-                } else {
-                    fm4_val = octile;
-                }
-                
-                int idx_a = a.first * global_width + a.second;
-                int idx_b = b.first * global_width + b.second;
-
-                const auto& dhEmbedding_HE = dhVectors[0];  // Assuming you used computeDHVectors(1)
-                float dh1_val = fabs(dhEmbedding_HE[idx_a] - dhEmbedding_HE[idx_b]);  // DH for hybrid computed with HE-based FM.
-            
-                float hybrid_val = fm4_val + dh1_val;
-                // return hybrid_val;
-            
-                // Standard DHk using ED or HE for DH might be the same.
+        
                 float dh5_val = 0.0f;
                 for (const auto& dh : dhVectors) {
                     double dist_a = dh[idx_a];
@@ -923,28 +1023,28 @@ vector<pii> a_star(const pii& start, const pii& goal, const pair<int, int>& grid
                     if (h > dh5_val)
                         dh5_val = h;
                 }
-
-                // max[FM4+DH,DH5]
-                return std::max(hybrid_val, dh5_val);
+        
+                return std::max(hybrid_val, dh5_val);  // max[FM[k−1] + DH[0], DH5]
             };
             break;
         }
-    
+        
     }
 
     g[start] = 0.0;
-    f[start] = g[start] + get_h(start, goal);
+    // f[start] = g[start] + get_h(start, goal);
+    f[start] = g[start] + get_h(start, goal) + 1e-5 * get_h(start, goal);  // tie-breaker
 
     while (!open_list.empty()) {
         pii current = open_list.top().second;
         open_list.pop();
 
         if (current == goal) {
-            expansion_log.push_back(expansions); // ✅ log before returning
+            expansion_log.push_back(expansions); //  log before returning
             return reconstruct_path(came_from, current);
         }
 
-        // ✅ Count expanded node
+        //  Count expanded node
         expansions++;
         closed_list.insert(current);
 
@@ -955,7 +1055,9 @@ vector<pii> a_star(const pii& start, const pii& goal, const pair<int, int>& grid
             if (!g.count(nb) || tentative_g < g[nb]) {
                 came_from[nb] = current;
                 g[nb] = tentative_g;
-                f[nb] = tentative_g + get_h(nb, goal);
+                // f[nb] = tentative_g + get_h(nb, goal);
+                float h_val = get_h(nb, goal);
+                f[nb] = tentative_g + h_val + 1e-5 * h_val;  // tie-break with small bias
                 open_list.emplace(f[nb], nb);
             }
         }
@@ -966,10 +1068,7 @@ vector<pii> a_star(const pii& start, const pii& goal, const pair<int, int>& grid
 
 
 // Returns a vector<double> of size (width * height). The index for cell (r, c) is: index = r * width + c.
-vector<double> dijkstraForLandmark(const pii& landmark,
-                                   int width,
-                                   int height,
-                                   const unordered_set<pii, pair_hash>& obstacles) {
+vector<double> dijkstraForLandmark(const pii& landmark, int width, int height, const unordered_set<pii, pair_hash>& obstacles) {
     int totalCells = width * height;
     if (width == 0 || height == 0) {
         std::cerr << "[ERROR] Grid width or height is zero." << std::endl;
@@ -1030,7 +1129,6 @@ vector<double> dijkstraForLandmark(const pii& landmark,
 
     return distance;
 }
-
 
 
 void computeDHVectors(int numLandmarks) {
@@ -1179,7 +1277,6 @@ void computeCapturedHeuristic(
 }
 
 
-
 void summarize_expansions() {
     if (expansion_log.empty()) return;
 
@@ -1241,15 +1338,19 @@ void* PrepareForSearch(const vector<bool>& bits, int width, int height, const st
     auto start_time = std::chrono::high_resolution_clock::now();
 
     // FM and FM+DH
-    int Kmax = 5;           // 10 -default Maximum number of dimensions.
+    int Kmax = 4;           // 10 -default Maximum number of dimensions.
     double epsilon = 1e-2;     // 1e-6 - Threshold for minimal distance.
-    vector<vector<double>> embedding = fastMap(edges, numFreeCells, Kmax, epsilon);
+    // vector<vector<double>> embedding;
+    // enum Mode { Single, Hybrid };
+    // Mode MODE = Single;
+    // if (MODE == Single) {
+    //     vector<vector<double>> embedding = fastMap(edges, numFreeCells, Kmax, epsilon);
+    // } else{
+    //     vector<vector<double>> embedding = fastMap_DHHYBRID(edges, numFreeCells, Kmax, epsilon);
+    // }
 
-    // // L1 norm
-    // vector<vector<double>> embedding = fastMapEnhanced(edges, numFreeCells, Kmax, epsilon);
-    // // L2 norm
-    // vector<vector<double>> embedding = fastMapEnhanced(edges, numFreeCells, Kmax, epsilon, FastMapNorm::L2);
-    
+    // vector<vector<double>> embedding = fastMap(edges, numFreeCells, Kmax, epsilon);
+    vector<vector<double>> embedding = fastMap_DHHYBRID(edges, numFreeCells, Kmax, epsilon);
 
     // Populate the global FM embedding mapping.
     fmEmbedding.clear();
@@ -1272,11 +1373,13 @@ void* PrepareForSearch(const vector<bool>& bits, int width, int height, const st
         }
     }
 
-    int Kmax_E = 9;           // 10 -default Maximum number of dimensions.
+    // HE for FM
+    int Kmax_E = 4;           // 10 -default Maximum number of dimensions.
     double epsilon_E = 1e-2;     // 1e-6 - Threshold for minimal distance.
     build_fmEmbedding_HE(width, height, Kmax_E, epsilon_E); // Build the FM embedding with HE pivot selection.
 
-    int numLandmarks_E = 1; // Number of landmarks for DH
+    // DH
+    int numLandmarks_E = 5; // Number of landmarks for DH
     computeDHVectors_E(numLandmarks_E); // Compute DH vectors for the first landmark.
 
     // DH
@@ -1284,34 +1387,37 @@ void* PrepareForSearch(const vector<bool>& bits, int width, int height, const st
     int numLandmarks = 5;  // or 20 or more, based on performance/memory tradeoff
     computeDHVectors(numLandmarks);
 
+
+    // Time taken for heuristic computation
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
     ctx->heuristic_micro_time = duration.count(); 
     heuristic_micro_time_global = ctx->heuristic_micro_time;
     std::cerr << "Heuristic computed in " << ctx->heuristic_micro_time << " ms " << std::endl;
 
-
     // // Compute captured heuristic
-    // for (int k = 1; k <= 10; ++k) {
+    // for (int k = 1; k <= 11; ++k) {
     //     computeDHVectors(1);  // always use 1 DH for FM[k−1] + DH
-    
-    //     vector<vector<double>> embedding = fastMap(edges, numFreeCells, k, epsilon);
+    //     vector<vector<double>> embedding = fastMap(edges, numFreeCells, Kmax, epsilon);
+    //     vector<vector<double>> embedding_DH = fastMap_DHHYBRID(edges, numFreeCells, k, epsilon);
     //     fmEmbedding.clear();
+    //     fmEmbedding_DH.clear();
     //     for (int i = 0; i < numFreeCells; i++) {
     //         fmEmbedding[indexToCell[i]] = embedding[i];
+    //         fmEmbedding_DH[indexToCell[i]] = embedding_DH[i];
     //     }
     
     //     computeCapturedHeuristic(
     //         cellToIndex,
-    //         fmEmbedding,
-    //         dhVectors,
+    //         fmEmbedding,         // pure FM[k]
+    //         fmEmbedding_DH,      // hybrid FM[k−1] + DH[0]
     //         k,
     //         global_obstacles,
     //         global_width,
     //         global_height
     //     );
     // }
-    
+
     return ctx;  
 }
 

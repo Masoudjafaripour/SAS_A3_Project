@@ -153,11 +153,7 @@ int RunExperiment(void* data) {
       }
       std::printf(" %.5f\n", plen);
     }
-    // total_num_experiments++;
-    // if (total_num_experiments > 5000) { // more than actual 50k -->> 100000 = 100k
-    //   std::cerr << "total_num_experiments is" << total_num_experiments << std::endl;
-    //   break;
-    // }
+
   }
   return scen.GetNumExperiments();
 }
@@ -256,15 +252,7 @@ void summarize_and_export_stats(const std::vector<int>& log,
     double stdev = sqrt(sum_sq / (n - 1));
     double ci_95 = 1.96 * stdev / sqrt(n);
 
-    // ✅ Print
-    // std::cout << std::fixed << std::setprecision(2);
-    // std::cout << "Total Problems: " << total_problems << std::endl;
-    // std::cout << "Mean: " << mean << std::endl;
-    // std::cout << "Median: " << median << std::endl;
-    // std::cout << "95% CI on mean: " << ci_95 << std::endl;
-    // std::cout << "Heuristic Time: " << heuristic_time_ms << " ms\n";
-
-    // ✅ Save to CSV
+    // Save to CSV
     std::ofstream fout(csv_filename);
     fout << "total_problems,mean,median,ci_95,heuristic_time_ms\n";
     fout << total_problems << ","
